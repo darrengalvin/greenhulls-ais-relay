@@ -44,20 +44,29 @@ async function updateSourceHealth(source, status) {
 // ── AISStream (primary source) ───────────────────────────────────
 function connectAisStream() {
   console.log(`[${ts()}] Connecting to AISStream.io...`);
+  console.log(`[${ts()}] API key: ${AIS_API_KEY.slice(0, 8)}...`);
   stats.aisstream.connected = false;
 
-  ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
+  try {
+    ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
+  } catch (e) {
+    console.error(`[${ts()}] WebSocket create failed:`, e.message);
+    setTimeout(connectAisStream, 15000);
+    return;
+  }
 
   ws.on("open", () => {
-    console.log(`[${ts()}] AISStream connected.`);
+    console.log(`[${ts()}] AISStream WebSocket open. Sending subscription...`);
     stats.aisstream.connected = true;
     updateSourceHealth("aisstream", "healthy");
 
-    ws.send(JSON.stringify({
+    const sub = {
       APIKey: AIS_API_KEY,
       BoundingBoxes: BOUNDING_BOXES,
       FilterMessageTypes: ["PositionReport", "StandardClassBPositionReport"],
-    }));
+    };
+    console.log(`[${ts()}] Subscription:`, JSON.stringify(sub).slice(0, 100));
+    ws.send(JSON.stringify(sub));
   });
 
   ws.on("message", async (data) => {
@@ -107,18 +116,20 @@ function connectAisStream() {
   });
 
   ws.on("error", (err) => {
-    console.error(`[${ts()}] AISStream error:`, err.message);
+    console.error(`[${ts()}] AISStream WebSocket error:`, err.message || err);
     stats.aisstream.errors++;
-    stats.aisstream.lastError = err.message;
+    stats.aisstream.lastError = String(err.message || err);
     stats.aisstream.connected = false;
     updateSourceHealth("aisstream", "down");
   });
 
-  ws.on("close", (code) => {
-    console.log(`[${ts()}] AISStream disconnected (${code}). Reconnecting in 10s...`);
+  ws.on("close", (code, reason) => {
+    const r = reason ? reason.toString() : 'no reason';
+    console.log(`[${ts()}] AISStream disconnected (code=${code}, reason=${r}). Reconnecting in 15s...`);
     stats.aisstream.connected = false;
     updateSourceHealth("aisstream", "down");
-    setTimeout(connectAisStream, 10000);
+    ws = null;
+    setTimeout(connectAisStream, 15000);
   });
 }
 
