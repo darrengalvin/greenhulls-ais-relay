@@ -1,0 +1,13 @@
+{
+  "name": "greenhulls-ais-relay",
+  "version": "1.0.0",
+  "description": "Connects to AISStream.io and relays vessel positions to Supabase",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "ws": "^8.18.0"
+  }
+}
