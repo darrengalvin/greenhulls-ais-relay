@@ -46,6 +46,8 @@ function connectAisStream() {
   console.log(`[${ts()}] Connecting to AISStream.io...`);
   console.log(`[${ts()}] API key: ${AIS_API_KEY.slice(0, 8)}...`);
   stats.aisstream.connected = false;
+  seenVessels.clear();
+  stats.aisstream.vessels = 0;
 
   try {
     ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
@@ -54,6 +56,8 @@ function connectAisStream() {
     setTimeout(connectAisStream, 15000);
     return;
   }
+
+  let pingInterval = null;
 
   ws.on("open", () => {
     console.log(`[${ts()}] AISStream WebSocket open. Sending subscription...`);
@@ -67,6 +71,12 @@ function connectAisStream() {
     };
     console.log(`[${ts()}] Subscription:`, JSON.stringify(sub).slice(0, 100));
     ws.send(JSON.stringify(sub));
+
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      }
+    }, 30000);
   });
 
   ws.on("message", async (data) => {
@@ -128,6 +138,7 @@ function connectAisStream() {
     console.log(`[${ts()}] AISStream disconnected (code=${code}, reason=${r}). Reconnecting in 15s...`);
     stats.aisstream.connected = false;
     updateSourceHealth("aisstream", "down");
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     ws = null;
     setTimeout(connectAisStream, 15000);
   });
@@ -213,17 +224,34 @@ async function pollMarineTraffic() {
   }
 }
 
-// ── Staleness detection ──────────────────────────────────────────
-// If AISStream goes silent for 2+ minutes, mark as degraded
+// ── Staleness detection + auto-reconnect ─────────────────────────
+const STALE_WARN_MS = 120_000;   // 2 min: log warning
+const STALE_RECONNECT_MS = 300_000; // 5 min: force reconnect
+
 function checkStaleness() {
   const now = Date.now();
-  if (stats.aisstream.lastMsg) {
-    const age = now - new Date(stats.aisstream.lastMsg).getTime();
-    if (age > 120000 && stats.aisstream.connected) {
-      console.warn(`[${ts()}] AISStream stale — no data for ${Math.round(age/1000)}s`);
-      updateSourceHealth("aisstream", "degraded");
-    }
+  if (!stats.aisstream.lastMsg) return;
+
+  const age = now - new Date(stats.aisstream.lastMsg).getTime();
+
+  if (age > STALE_RECONNECT_MS && stats.aisstream.connected) {
+    console.warn(`[${ts()}] AISStream zombie — no data for ${Math.round(age/1000)}s. Forcing reconnect...`);
+    updateSourceHealth("aisstream", "down");
+    forceReconnect();
+  } else if (age > STALE_WARN_MS && stats.aisstream.connected) {
+    console.warn(`[${ts()}] AISStream stale — no data for ${Math.round(age/1000)}s`);
+    updateSourceHealth("aisstream", "degraded");
   }
+}
+
+function forceReconnect() {
+  stats.aisstream.connected = false;
+  if (ws) {
+    try { ws.terminate(); } catch (_) {}
+    ws = null;
+  }
+  console.log(`[${ts()}] Scheduling reconnect in 5s...`);
+  setTimeout(connectAisStream, 5000);
 }
 
 function ts() {
@@ -233,8 +261,13 @@ function ts() {
 // ── Health + status logging ──────────────────────────────────────
 setInterval(() => {
   const s = stats.aisstream;
-  console.log(`[${ts()}] AISStream: ${s.messages} msgs, ${seenVessels.size} vessels, ${s.errors} errors, connected=${s.connected}`);
-  if (s.connected) updateSourceHealth("aisstream", "healthy");
+  const staleAge = s.lastMsg ? Date.now() - new Date(s.lastMsg).getTime() : null;
+  const staleStr = staleAge ? `, last_data=${Math.round(staleAge/1000)}s ago` : '';
+  console.log(`[${ts()}] AISStream: ${s.messages} msgs, ${seenVessels.size} vessels, ${s.errors} errors, connected=${s.connected}${staleStr}`);
+
+  if (s.connected && staleAge && staleAge < STALE_WARN_MS) {
+    updateSourceHealth("aisstream", "healthy");
+  }
   checkStaleness();
 }, 60000);
 
