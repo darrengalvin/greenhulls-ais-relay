@@ -15,6 +15,17 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const BOUNDING_BOXES = [[[54.0, -1.0], [62.5, 4.0]]];
 
+// ── Rate-limit-safe connection strategy ──────────────────────────
+// AISStream will 429 or silently throttle if we reconnect too often.
+// Strategy: ONE persistent connection. Only reconnect on actual close
+// events, with long backoff. Never reconnect just because data is slow.
+const RECONNECT_BASE = 30_000;   // 30s minimum between reconnects
+const RECONNECT_MAX  = 600_000;  // 10 min max backoff
+const MAX_FAILURES   = 10;       // after 10 consecutive failures, wait 30 min
+
+let reconnectDelay = RECONNECT_BASE;
+let consecutiveFailures = 0;
+
 // ── Health tracking ──────────────────────────────────────────────
 let stats = {
   aisstream: { messages: 0, vessels: 0, errors: 0, lastMsg: null, lastError: null, connected: false },
@@ -25,14 +36,6 @@ let ws = null;
 let pingInterval = null;
 let reconnectTimer = null;
 let connectTime = null;
-
-let reconnectDelay = 15_000;
-const RECONNECT_MIN = 15_000;
-const RECONNECT_MAX = 300_000;
-
-const STALE_WARN_MS = 120_000;
-const STALE_RECONNECT_MS = 300_000;
-const EMPTY_CONNECT_MS = 120_000; // reconnect if 0 messages after 2 min
 
 async function updateSourceHealth(source, status) {
   const s = stats[source];
@@ -52,9 +55,10 @@ async function updateSourceHealth(source, status) {
   }
 }
 
-// ── AISStream (primary source) ───────────────────────────────────
+// ── AISStream connection ─────────────────────────────────────────
 function scheduleReconnect(delay) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  console.log(`[${ts()}] Next reconnect in ${Math.round(delay/1000)}s`);
   reconnectTimer = setTimeout(connectAisStream, delay);
 }
 
@@ -69,13 +73,29 @@ function cleanup() {
   connectTime = null;
 }
 
+function getNextDelay(wasRateLimited) {
+  consecutiveFailures++;
+
+  if (consecutiveFailures >= MAX_FAILURES) {
+    const cooldown = 30 * 60_000; // 30 minutes
+    console.warn(`[${ts()}] ${consecutiveFailures} consecutive failures — cooling off for 30 min`);
+    return cooldown;
+  }
+
+  if (wasRateLimited) {
+    reconnectDelay = Math.min(reconnectDelay * 3, RECONNECT_MAX);
+  } else {
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+  }
+
+  return reconnectDelay;
+}
+
 function connectAisStream() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-
   cleanup();
 
-  console.log(`[${ts()}] Connecting to AISStream.io...`);
-  console.log(`[${ts()}] API key: ${AIS_API_KEY.slice(0, 8)}...`);
+  console.log(`[${ts()}] Connecting to AISStream.io (attempt after ${consecutiveFailures} failures)...`);
   seenVessels.clear();
   stats.aisstream.vessels = 0;
 
@@ -83,33 +103,34 @@ function connectAisStream() {
     ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
   } catch (e) {
     console.error(`[${ts()}] WebSocket create failed:`, e.message);
-    scheduleReconnect(reconnectDelay);
+    scheduleReconnect(getNextDelay(false));
     return;
   }
 
   const currentWs = ws;
   let gotRateLimited = false;
+  let receivedData = false;
 
   currentWs.on("open", () => {
     if (ws !== currentWs) return;
-    console.log(`[${ts()}] AISStream WebSocket open. Sending subscription...`);
+    console.log(`[${ts()}] WebSocket open. Sending subscription...`);
     stats.aisstream.connected = true;
     connectTime = Date.now();
-    updateSourceHealth("aisstream", "healthy");
+    updateSourceHealth("aisstream", "connecting");
 
     const sub = {
       APIKey: AIS_API_KEY,
       BoundingBoxes: BOUNDING_BOXES,
       FilterMessageTypes: ["PositionReport", "StandardClassBPositionReport"],
     };
-    console.log(`[${ts()}] Subscription:`, JSON.stringify(sub).slice(0, 100));
     currentWs.send(JSON.stringify(sub));
 
+    // Gentle keepalive — every 60s, not 30s
     pingInterval = setInterval(() => {
       if (currentWs.readyState === WebSocket.OPEN) {
         currentWs.ping();
       }
-    }, 30000);
+    }, 60_000);
   });
 
   currentWs.on("message", async (data) => {
@@ -147,7 +168,14 @@ function connectAisStream() {
 
       stats.aisstream.messages++;
       stats.aisstream.lastMsg = new Date().toISOString();
-      reconnectDelay = RECONNECT_MIN;
+
+      if (!receivedData) {
+        receivedData = true;
+        consecutiveFailures = 0;
+        reconnectDelay = RECONNECT_BASE;
+        console.log(`[${ts()}] Data flowing — failure counter reset`);
+        updateSourceHealth("aisstream", "healthy");
+      }
 
       if (!seenVessels.has(mmsi)) {
         seenVessels.set(mmsi, { name: shipName, source: "aisstream" });
@@ -163,7 +191,7 @@ function connectAisStream() {
 
   currentWs.on("error", (err) => {
     const msg = String(err.message || err);
-    console.error(`[${ts()}] AISStream WebSocket error:`, msg);
+    console.error(`[${ts()}] WebSocket error:`, msg);
     stats.aisstream.errors++;
     stats.aisstream.lastError = msg;
     if (msg.includes("429")) gotRateLimited = true;
@@ -171,20 +199,19 @@ function connectAisStream() {
 
   currentWs.on("close", (code, reason) => {
     if (ws !== currentWs) return;
-    const r = reason ? reason.toString() : 'no reason';
+    const r = reason ? reason.toString() : '';
     cleanup();
 
     if (gotRateLimited) {
-      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
-      console.warn(`[${ts()}] Rate limited (429). Backing off — next retry in ${Math.round(reconnectDelay/1000)}s`);
+      console.warn(`[${ts()}] Rate limited (429).`);
       updateSourceHealth("aisstream", "rate_limited");
     } else {
-      reconnectDelay = RECONNECT_MIN;
-      console.log(`[${ts()}] AISStream disconnected (code=${code}, reason=${r}). Reconnecting in ${Math.round(reconnectDelay/1000)}s...`);
+      console.log(`[${ts()}] Disconnected (code=${code}${r ? ', reason=' + r : ''}).`);
       updateSourceHealth("aisstream", "down");
     }
 
-    scheduleReconnect(reconnectDelay);
+    const delay = getNextDelay(gotRateLimited);
+    scheduleReconnect(delay);
   });
 }
 
@@ -209,7 +236,7 @@ async function writePosition({ vesselId, mmsi, shipName, lat, lon, sog, heading,
   }
 }
 
-// ── MarineTraffic polling (failover / cross-validation) ──────────
+// ── MarineTraffic polling (failover) ─────────────────────────────
 async function pollMarineTraffic() {
   if (!MARINETRAFFIC_API_KEY) return;
 
@@ -230,23 +257,19 @@ async function pollMarineTraffic() {
 
     for (const v of vessels) {
       const mmsi = v.MMSI;
-      const existing = seenVessels.get(Number(mmsi));
+      if (seenVessels.has(Number(mmsi))) continue;
 
-      if (existing && existing.source === "aisstream") continue;
-
-      if (!seenVessels.has(Number(mmsi))) {
-        await writePosition({
-          vesselId: `ais_${mmsi}`,
-          mmsi: String(mmsi),
-          shipName: v.SHIPNAME || "",
-          lat: Number(v.LAT),
-          lon: Number(v.LON),
-          sog: Number(v.SPEED) / 10,
-          heading: v.HEADING ? Number(v.HEADING) : null,
-          cog: v.COURSE ? Number(v.COURSE) : null,
-          source: "ais",
-        });
-      }
+      await writePosition({
+        vesselId: `ais_${mmsi}`,
+        mmsi: String(mmsi),
+        shipName: v.SHIPNAME || "",
+        lat: Number(v.LAT),
+        lon: Number(v.LON),
+        sog: Number(v.SPEED) / 10,
+        heading: v.HEADING ? Number(v.HEADING) : null,
+        cog: v.COURSE ? Number(v.COURSE) : null,
+        source: "ais",
+      });
     }
 
     updateSourceHealth("marinetraffic", "healthy");
@@ -259,61 +282,33 @@ async function pollMarineTraffic() {
   }
 }
 
-// ── Staleness detection + auto-reconnect ─────────────────────────
-function checkStaleness() {
-  if (!stats.aisstream.connected) return;
-  const now = Date.now();
-
-  if (stats.aisstream.lastMsg) {
-    const age = now - new Date(stats.aisstream.lastMsg).getTime();
-    if (age > STALE_RECONNECT_MS) {
-      console.warn(`[${ts()}] AISStream zombie — no data for ${Math.round(age/1000)}s. Forcing reconnect...`);
-      updateSourceHealth("aisstream", "down");
-      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
-      connectAisStream();
-      return;
-    }
-    if (age > STALE_WARN_MS) {
-      console.warn(`[${ts()}] AISStream stale — no data for ${Math.round(age/1000)}s`);
-      updateSourceHealth("aisstream", "degraded");
-    }
-  } else if (connectTime) {
-    const connAge = now - connectTime;
-    if (connAge > EMPTY_CONNECT_MS) {
-      console.warn(`[${ts()}] Connected ${Math.round(connAge/1000)}s ago but 0 messages received. Reconnecting...`);
-      updateSourceHealth("aisstream", "empty");
-      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
-      connectAisStream();
-    }
-  }
-}
-
-function ts() {
-  return new Date().toISOString().slice(11, 19);
-}
-
-// ── Health + status logging ──────────────────────────────────────
+// ── Status logging (NO auto-reconnect from here) ─────────────────
+// The old code triggered reconnects from the status check, which
+// caused runaway reconnect loops. Now we ONLY reconnect from the
+// close handler. This interval is purely informational.
 setInterval(() => {
   const s = stats.aisstream;
   const staleAge = s.lastMsg ? Date.now() - new Date(s.lastMsg).getTime() : null;
   const connAge = connectTime ? Math.round((Date.now() - connectTime) / 1000) : null;
   let extra = '';
   if (staleAge) extra += `, last_data=${Math.round(staleAge/1000)}s ago`;
-  if (connAge) extra += `, connected_for=${connAge}s`;
-  extra += `, backoff=${Math.round(reconnectDelay/1000)}s`;
-  console.log(`[${ts()}] AISStream: ${s.messages} msgs, ${seenVessels.size} vessels, ${s.errors} errors, connected=${s.connected}${extra}`);
+  if (connAge !== null) extra += `, up=${connAge}s`;
+  extra += `, failures=${consecutiveFailures}, backoff=${Math.round(reconnectDelay/1000)}s`;
+  console.log(`[${ts()}] AISStream: ${s.messages} msgs, ${seenVessels.size} vessels, ${s.errors} errs, connected=${s.connected}${extra}`);
 
-  if (s.connected && staleAge && staleAge < STALE_WARN_MS) {
+  if (s.connected && staleAge && staleAge < 120_000) {
     updateSourceHealth("aisstream", "healthy");
   }
-  checkStaleness();
-}, 60000);
+}, 60_000);
 
-// Poll MarineTraffic every 60s if key is set
 if (MARINETRAFFIC_API_KEY) {
   console.log(`[${ts()}] MarineTraffic failover enabled`);
-  setInterval(pollMarineTraffic, 60000);
+  setInterval(pollMarineTraffic, 60_000);
   pollMarineTraffic();
+}
+
+function ts() {
+  return new Date().toISOString().slice(11, 19);
 }
 
 // ── HTTP health endpoint ─────────────────────────────────────────
@@ -325,6 +320,7 @@ http.createServer((req, res) => {
   res.end(JSON.stringify({
     status: stats.aisstream.connected ? "healthy" : "degraded",
     reconnect_delay_s: Math.round(reconnectDelay / 1000),
+    consecutive_failures: consecutiveFailures,
     sources: {
       aisstream: {
         connected: stats.aisstream.connected,
@@ -344,6 +340,6 @@ http.createServer((req, res) => {
     uptime_seconds: Math.floor(process.uptime()),
   }));
 }).listen(PORT, () => {
-  console.log(`[${ts()}] GreenHulls AIS Relay v3 — health on :${PORT}`);
+  console.log(`[${ts()}] GreenHulls AIS Relay v4 — health on :${PORT}`);
   connectAisStream();
 });
