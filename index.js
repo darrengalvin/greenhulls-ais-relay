@@ -22,9 +22,17 @@ let stats = {
 };
 const seenVessels = new Map();
 let ws = null;
-let reconnectDelay = 15_000; // starts at 15s, grows on 429s
+let pingInterval = null;
+let reconnectTimer = null;
+let connectTime = null;
+
+let reconnectDelay = 15_000;
 const RECONNECT_MIN = 15_000;
-const RECONNECT_MAX = 300_000; // 5 min cap
+const RECONNECT_MAX = 300_000;
+
+const STALE_WARN_MS = 120_000;
+const STALE_RECONNECT_MS = 300_000;
+const EMPTY_CONNECT_MS = 120_000; // reconnect if 0 messages after 2 min
 
 async function updateSourceHealth(source, status) {
   const s = stats[source];
@@ -45,10 +53,29 @@ async function updateSourceHealth(source, status) {
 }
 
 // ── AISStream (primary source) ───────────────────────────────────
+function scheduleReconnect(delay) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connectAisStream, delay);
+}
+
+function cleanup() {
+  if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+  if (ws) {
+    ws.removeAllListeners();
+    try { ws.terminate(); } catch (_) {}
+    ws = null;
+  }
+  stats.aisstream.connected = false;
+  connectTime = null;
+}
+
 function connectAisStream() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+  cleanup();
+
   console.log(`[${ts()}] Connecting to AISStream.io...`);
   console.log(`[${ts()}] API key: ${AIS_API_KEY.slice(0, 8)}...`);
-  stats.aisstream.connected = false;
   seenVessels.clear();
   stats.aisstream.vessels = 0;
 
@@ -56,15 +83,18 @@ function connectAisStream() {
     ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
   } catch (e) {
     console.error(`[${ts()}] WebSocket create failed:`, e.message);
-    setTimeout(connectAisStream, reconnectDelay);
+    scheduleReconnect(reconnectDelay);
     return;
   }
 
-  let pingInterval = null;
+  const currentWs = ws;
+  let gotRateLimited = false;
 
-  ws.on("open", () => {
+  currentWs.on("open", () => {
+    if (ws !== currentWs) return;
     console.log(`[${ts()}] AISStream WebSocket open. Sending subscription...`);
     stats.aisstream.connected = true;
+    connectTime = Date.now();
     updateSourceHealth("aisstream", "healthy");
 
     const sub = {
@@ -73,16 +103,17 @@ function connectAisStream() {
       FilterMessageTypes: ["PositionReport", "StandardClassBPositionReport"],
     };
     console.log(`[${ts()}] Subscription:`, JSON.stringify(sub).slice(0, 100));
-    ws.send(JSON.stringify(sub));
+    currentWs.send(JSON.stringify(sub));
 
     pingInterval = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.ping();
+      if (currentWs.readyState === WebSocket.OPEN) {
+        currentWs.ping();
       }
     }, 30000);
   });
 
-  ws.on("message", async (data) => {
+  currentWs.on("message", async (data) => {
+    if (ws !== currentWs) return;
     try {
       const msg = JSON.parse(data.toString());
       const type = msg.MessageType;
@@ -116,9 +147,8 @@ function connectAisStream() {
 
       stats.aisstream.messages++;
       stats.aisstream.lastMsg = new Date().toISOString();
-      if (reconnectDelay > RECONNECT_MIN) {
-        reconnectDelay = RECONNECT_MIN;
-      }
+      reconnectDelay = RECONNECT_MIN;
+
       if (!seenVessels.has(mmsi)) {
         seenVessels.set(mmsi, { name: shipName, source: "aisstream" });
         stats.aisstream.vessels = seenVessels.size;
@@ -131,26 +161,18 @@ function connectAisStream() {
     }
   });
 
-  let gotRateLimited = false;
-
-  ws.on("error", (err) => {
+  currentWs.on("error", (err) => {
     const msg = String(err.message || err);
     console.error(`[${ts()}] AISStream WebSocket error:`, msg);
     stats.aisstream.errors++;
     stats.aisstream.lastError = msg;
-    stats.aisstream.connected = false;
-
-    if (msg.includes("429")) {
-      gotRateLimited = true;
-    }
-    updateSourceHealth("aisstream", "down");
+    if (msg.includes("429")) gotRateLimited = true;
   });
 
-  ws.on("close", (code, reason) => {
+  currentWs.on("close", (code, reason) => {
+    if (ws !== currentWs) return;
     const r = reason ? reason.toString() : 'no reason';
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-    ws = null;
-    stats.aisstream.connected = false;
+    cleanup();
 
     if (gotRateLimited) {
       reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
@@ -162,7 +184,7 @@ function connectAisStream() {
       updateSourceHealth("aisstream", "down");
     }
 
-    setTimeout(connectAisStream, reconnectDelay);
+    scheduleReconnect(reconnectDelay);
   });
 }
 
@@ -188,13 +210,10 @@ async function writePosition({ vesselId, mmsi, shipName, lat, lon, sog, heading,
 }
 
 // ── MarineTraffic polling (failover / cross-validation) ──────────
-// Polls MarineTraffic REST API every 60s as a backup.
-// Only active if MARINETRAFFIC_API_KEY is set.
 async function pollMarineTraffic() {
   if (!MARINETRAFFIC_API_KEY) return;
 
   try {
-    // MarineTraffic PS07 endpoint: positions in area
     const url = `https://services.marinetraffic.com/api/exportvessel/v:8/${MARINETRAFFIC_API_KEY}/MINLAT:54/MAXLAT:62.5/MINLON:-1/MAXLON:4/protocol:jsono`;
     const res = await fetch(url);
     if (!res.ok) {
@@ -213,14 +232,8 @@ async function pollMarineTraffic() {
       const mmsi = v.MMSI;
       const existing = seenVessels.get(Number(mmsi));
 
-      // Cross-validate: if we already have this vessel from AISStream,
-      // check if positions roughly match (within 1km)
-      if (existing && existing.source === "aisstream") {
-        // Just log for now — in production this would trigger alerts
-        continue;
-      }
+      if (existing && existing.source === "aisstream") continue;
 
-      // Write vessels we DON'T have from AISStream (failover)
       if (!seenVessels.has(Number(mmsi))) {
         await writePosition({
           vesselId: `ais_${mmsi}`,
@@ -228,7 +241,7 @@ async function pollMarineTraffic() {
           shipName: v.SHIPNAME || "",
           lat: Number(v.LAT),
           lon: Number(v.LON),
-          sog: Number(v.SPEED) / 10, // MT returns speed in 1/10 knots
+          sog: Number(v.SPEED) / 10,
           heading: v.HEADING ? Number(v.HEADING) : null,
           cog: v.COURSE ? Number(v.COURSE) : null,
           source: "ais",
@@ -247,34 +260,32 @@ async function pollMarineTraffic() {
 }
 
 // ── Staleness detection + auto-reconnect ─────────────────────────
-const STALE_WARN_MS = 120_000;   // 2 min: log warning
-const STALE_RECONNECT_MS = 300_000; // 5 min: force reconnect
-
 function checkStaleness() {
+  if (!stats.aisstream.connected) return;
   const now = Date.now();
-  if (!stats.aisstream.lastMsg) return;
 
-  const age = now - new Date(stats.aisstream.lastMsg).getTime();
-
-  if (age > STALE_RECONNECT_MS && stats.aisstream.connected) {
-    console.warn(`[${ts()}] AISStream zombie — no data for ${Math.round(age/1000)}s. Forcing reconnect...`);
-    updateSourceHealth("aisstream", "down");
-    forceReconnect();
-  } else if (age > STALE_WARN_MS && stats.aisstream.connected) {
-    console.warn(`[${ts()}] AISStream stale — no data for ${Math.round(age/1000)}s`);
-    updateSourceHealth("aisstream", "degraded");
+  if (stats.aisstream.lastMsg) {
+    const age = now - new Date(stats.aisstream.lastMsg).getTime();
+    if (age > STALE_RECONNECT_MS) {
+      console.warn(`[${ts()}] AISStream zombie — no data for ${Math.round(age/1000)}s. Forcing reconnect...`);
+      updateSourceHealth("aisstream", "down");
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+      connectAisStream();
+      return;
+    }
+    if (age > STALE_WARN_MS) {
+      console.warn(`[${ts()}] AISStream stale — no data for ${Math.round(age/1000)}s`);
+      updateSourceHealth("aisstream", "degraded");
+    }
+  } else if (connectTime) {
+    const connAge = now - connectTime;
+    if (connAge > EMPTY_CONNECT_MS) {
+      console.warn(`[${ts()}] Connected ${Math.round(connAge/1000)}s ago but 0 messages received. Reconnecting...`);
+      updateSourceHealth("aisstream", "empty");
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+      connectAisStream();
+    }
   }
-}
-
-function forceReconnect() {
-  stats.aisstream.connected = false;
-  if (ws) {
-    try { ws.terminate(); } catch (_) {}
-    ws = null;
-  }
-  const delay = Math.max(reconnectDelay, RECONNECT_MIN);
-  console.log(`[${ts()}] Scheduling reconnect in ${Math.round(delay/1000)}s...`);
-  setTimeout(connectAisStream, delay);
 }
 
 function ts() {
@@ -285,8 +296,12 @@ function ts() {
 setInterval(() => {
   const s = stats.aisstream;
   const staleAge = s.lastMsg ? Date.now() - new Date(s.lastMsg).getTime() : null;
-  const staleStr = staleAge ? `, last_data=${Math.round(staleAge/1000)}s ago` : '';
-  console.log(`[${ts()}] AISStream: ${s.messages} msgs, ${seenVessels.size} vessels, ${s.errors} errors, connected=${s.connected}${staleStr}`);
+  const connAge = connectTime ? Math.round((Date.now() - connectTime) / 1000) : null;
+  let extra = '';
+  if (staleAge) extra += `, last_data=${Math.round(staleAge/1000)}s ago`;
+  if (connAge) extra += `, connected_for=${connAge}s`;
+  extra += `, backoff=${Math.round(reconnectDelay/1000)}s`;
+  console.log(`[${ts()}] AISStream: ${s.messages} msgs, ${seenVessels.size} vessels, ${s.errors} errors, connected=${s.connected}${extra}`);
 
   if (s.connected && staleAge && staleAge < STALE_WARN_MS) {
     updateSourceHealth("aisstream", "healthy");
@@ -309,6 +324,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
     status: stats.aisstream.connected ? "healthy" : "degraded",
+    reconnect_delay_s: Math.round(reconnectDelay / 1000),
     sources: {
       aisstream: {
         connected: stats.aisstream.connected,
@@ -316,6 +332,7 @@ http.createServer((req, res) => {
         vessels: seenVessels.size,
         errors: stats.aisstream.errors,
         last_message: stats.aisstream.lastMsg,
+        connected_since: connectTime ? new Date(connectTime).toISOString() : null,
       },
       marinetraffic: {
         enabled: !!MARINETRAFFIC_API_KEY,
@@ -327,6 +344,6 @@ http.createServer((req, res) => {
     uptime_seconds: Math.floor(process.uptime()),
   }));
 }).listen(PORT, () => {
-  console.log(`[${ts()}] GreenHulls AIS Relay v2 — health on :${PORT}`);
+  console.log(`[${ts()}] GreenHulls AIS Relay v3 — health on :${PORT}`);
   connectAisStream();
 });
