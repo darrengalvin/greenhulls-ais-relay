@@ -22,6 +22,9 @@ let stats = {
 };
 const seenVessels = new Map();
 let ws = null;
+let reconnectDelay = 15_000; // starts at 15s, grows on 429s
+const RECONNECT_MIN = 15_000;
+const RECONNECT_MAX = 300_000; // 5 min cap
 
 async function updateSourceHealth(source, status) {
   const s = stats[source];
@@ -53,7 +56,7 @@ function connectAisStream() {
     ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
   } catch (e) {
     console.error(`[${ts()}] WebSocket create failed:`, e.message);
-    setTimeout(connectAisStream, 15000);
+    setTimeout(connectAisStream, reconnectDelay);
     return;
   }
 
@@ -113,6 +116,9 @@ function connectAisStream() {
 
       stats.aisstream.messages++;
       stats.aisstream.lastMsg = new Date().toISOString();
+      if (reconnectDelay > RECONNECT_MIN) {
+        reconnectDelay = RECONNECT_MIN;
+      }
       if (!seenVessels.has(mmsi)) {
         seenVessels.set(mmsi, { name: shipName, source: "aisstream" });
         stats.aisstream.vessels = seenVessels.size;
@@ -125,22 +131,38 @@ function connectAisStream() {
     }
   });
 
+  let gotRateLimited = false;
+
   ws.on("error", (err) => {
-    console.error(`[${ts()}] AISStream WebSocket error:`, err.message || err);
+    const msg = String(err.message || err);
+    console.error(`[${ts()}] AISStream WebSocket error:`, msg);
     stats.aisstream.errors++;
-    stats.aisstream.lastError = String(err.message || err);
+    stats.aisstream.lastError = msg;
     stats.aisstream.connected = false;
+
+    if (msg.includes("429")) {
+      gotRateLimited = true;
+    }
     updateSourceHealth("aisstream", "down");
   });
 
   ws.on("close", (code, reason) => {
     const r = reason ? reason.toString() : 'no reason';
-    console.log(`[${ts()}] AISStream disconnected (code=${code}, reason=${r}). Reconnecting in 15s...`);
-    stats.aisstream.connected = false;
-    updateSourceHealth("aisstream", "down");
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     ws = null;
-    setTimeout(connectAisStream, 15000);
+    stats.aisstream.connected = false;
+
+    if (gotRateLimited) {
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+      console.warn(`[${ts()}] Rate limited (429). Backing off — next retry in ${Math.round(reconnectDelay/1000)}s`);
+      updateSourceHealth("aisstream", "rate_limited");
+    } else {
+      reconnectDelay = RECONNECT_MIN;
+      console.log(`[${ts()}] AISStream disconnected (code=${code}, reason=${r}). Reconnecting in ${Math.round(reconnectDelay/1000)}s...`);
+      updateSourceHealth("aisstream", "down");
+    }
+
+    setTimeout(connectAisStream, reconnectDelay);
   });
 }
 
@@ -250,8 +272,9 @@ function forceReconnect() {
     try { ws.terminate(); } catch (_) {}
     ws = null;
   }
-  console.log(`[${ts()}] Scheduling reconnect in 5s...`);
-  setTimeout(connectAisStream, 5000);
+  const delay = Math.max(reconnectDelay, RECONNECT_MIN);
+  console.log(`[${ts()}] Scheduling reconnect in ${Math.round(delay/1000)}s...`);
+  setTimeout(connectAisStream, delay);
 }
 
 function ts() {
