@@ -282,14 +282,17 @@ async function pollMarineTraffic() {
   }
 }
 
-// ── Status logging (NO auto-reconnect from here) ─────────────────
-// The old code triggered reconnects from the status check, which
-// caused runaway reconnect loops. Now we ONLY reconnect from the
-// close handler. This interval is purely informational.
+// ── Status logging + gentle zombie detection ─────────────────────
+// Only reconnect on zombie if data stopped for 1+ hour AND we haven't
+// already tried recently (tracked by lastZombieReconnect).
+const ZOMBIE_THRESHOLD_MS = 3600_000; // 1 hour of silence
+let lastZombieReconnect = 0;
+
 setInterval(() => {
   const s = stats.aisstream;
-  const staleAge = s.lastMsg ? Date.now() - new Date(s.lastMsg).getTime() : null;
-  const connAge = connectTime ? Math.round((Date.now() - connectTime) / 1000) : null;
+  const now = Date.now();
+  const staleAge = s.lastMsg ? now - new Date(s.lastMsg).getTime() : null;
+  const connAge = connectTime ? Math.round((now - connectTime) / 1000) : null;
   let extra = '';
   if (staleAge) extra += `, last_data=${Math.round(staleAge/1000)}s ago`;
   if (connAge !== null) extra += `, up=${connAge}s`;
@@ -298,6 +301,27 @@ setInterval(() => {
 
   if (s.connected && staleAge && staleAge < 120_000) {
     updateSourceHealth("aisstream", "healthy");
+  }
+
+  // Zombie detection: connected but no data for 1+ hour
+  if (s.connected && staleAge && staleAge > ZOMBIE_THRESHOLD_MS) {
+    const sinceLast = now - lastZombieReconnect;
+    if (sinceLast > ZOMBIE_THRESHOLD_MS) {
+      console.warn(`[${ts()}] Zombie connection — no data for ${Math.round(staleAge/1000)}s. Trying one reconnect...`);
+      lastZombieReconnect = now;
+      updateSourceHealth("aisstream", "zombie");
+      connectAisStream();
+    }
+  }
+
+  // Also catch: connected but NEVER received data for 1 hour
+  if (s.connected && !s.lastMsg && connectTime && (now - connectTime) > ZOMBIE_THRESHOLD_MS) {
+    const sinceLast = now - lastZombieReconnect;
+    if (sinceLast > ZOMBIE_THRESHOLD_MS) {
+      console.warn(`[${ts()}] Connected ${Math.round((now-connectTime)/1000)}s with 0 messages. Trying one reconnect...`);
+      lastZombieReconnect = now;
+      connectAisStream();
+    }
   }
 }, 60_000);
 
